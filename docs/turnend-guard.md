@@ -32,7 +32,7 @@ The health check is PID-namespace-aware.
 At lock acquisition, `bin/fm-watch.sh` records `readlink /proc/self/ns/pid` as `pid-namespace` in the lock owner dir, alongside `pid`, `pid-identity`, `fm-home`, and `watcher-path`.
 A caller in the same namespace, or reading a lock with no recorded namespace (an older watcher's lock, or a host without `/proc`), keeps the full pid liveness and identity checks.
 A caller in a different namespace, or one that cannot read its own `/proc/self/ns/pid`, cannot see the watcher pid at all, so `fm_watcher_healthy` instead accepts the watcher when the lock's `fm-home` and `watcher-path` match and the beacon is fresh, skipping `fm_pid_alive` and `fm_pid_identity`.
-Within the grace window, a genuinely dead watcher whose lock recorded a namespace is caught for namespaced callers by `bin/fm-guard.sh`'s pull-based banner, which runs in normal shells; same-namespace behavior is unchanged.
+For a namespaced caller, a genuinely dead watcher whose lock recorded a namespace is accepted only until its beacon goes stale after at most `FM_GUARD_GRACE` seconds, at which point both `bin/fm-guard.sh`'s pull-based banner and turn-end blocking resume as the dead-watcher backstop; same-namespace behavior is unchanged.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
@@ -119,7 +119,7 @@ Command run to reproduce against a live watcher: `bwrap --unshare-pid --ro-bind 
 Observed output before the fix: the bordered banner plus `rc=2` inside bwrap, while the same command outside bwrap printed nothing and exited 0.
 The fix is the namespace-aware health check described in Shared Predicate: `bin/fm-watch.sh` records `pid-namespace` at lock acquisition, and `bin/fm-wake-lib.sh` skips the meaningless pid checks only for cross-namespace callers.
 Observed output after the fix on the same host: the bwrap repro printed nothing and exited `rc=0`; a bwrap control with the lock's `pid-namespace` file removed still printed the banner and exited `rc=2` (the backward-compat pid-check path); a dead watcher pid with a matching recorded namespace still blocked with `rc=2` outside the sandbox; and a cross-namespace lock with a stale beacon still blocked with `rc=2`.
-The remaining fail-open tradeoff is deliberate and bounded: a watcher that dies leaves its beacon fresh for up to `FM_GUARD_GRACE` seconds, during which a namespaced caller accepts the lock on `fm-home`/`watcher-path` match alone, and `bin/fm-guard.sh`'s pull-based banner in normal shells remains the dead-watcher backstop there.
+The remaining fail-open tradeoff is deliberate and bounded: a watcher that dies leaves its beacon fresh for up to `FM_GUARD_GRACE` seconds, during which a namespaced caller accepts the lock on `fm-home`/`watcher-path` match alone; once the beacon goes stale after at most `FM_GUARD_GRACE` seconds, both `bin/fm-guard.sh`'s pull-based banner and turn-end blocking resume as the dead-watcher backstop.
 
 ## Tests
 

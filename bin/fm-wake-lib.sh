@@ -101,8 +101,9 @@ fm_watcher_healthy() {
   else
     # Cross-namespace caller: pid liveness/identity would reject a live watcher
     # whose pid this namespace cannot see, so accept on home/path match plus the
-    # fresh-beacon check below. bin/fm-guard.sh's pull-based banner in normal
-    # shells stays the dead-watcher backstop within the grace window.
+    # fresh-beacon check below. A dead watcher's beacon goes stale after at most
+    # FM_GUARD_GRACE seconds, at which point fm-guard.sh's banner and turn-end
+    # blocking resume as the dead-watcher backstop.
     fm_watcher_lock_matches_home_path "$state" "$watch_path" "$home" || return 1
   fi
   age=$(fm_path_age "$beat")
