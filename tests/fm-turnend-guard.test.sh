@@ -156,7 +156,7 @@ watcher_identity() {
 }
 
 record_watcher_lock() {
-  local dir=$1 pid=$2 identity=$3 root bin_dir
+  local dir=$1 pid=$2 identity=$3 ns=${4:-} root bin_dir
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$dir/bin" && pwd)
   mkdir -p "$dir/state/.watch.lock"
@@ -164,6 +164,26 @@ record_watcher_lock() {
   printf '%s\n' "$root" > "$dir/state/.watch.lock/fm-home"
   printf '%s\n' "$bin_dir/fm-watch.sh" > "$dir/state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
+  [ -n "$ns" ] && printf '%s\n' "$ns" > "$dir/state/.watch.lock/pid-namespace"
+  return 0
+}
+
+own_pid_namespace() {
+  readlink /proc/self/ns/pid 2>/dev/null
+}
+
+# Run the hook from inside an unshared PID namespace, where external pids are
+# invisible - the sandboxed-Stop-hook context of the 2026-07-09 false alarm.
+run_hook_in_pid_ns_sandbox() {
+  local dir=$1 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":false}' | bwrap --unshare-pid --ro-bind / / --proc /proc --dev /dev -- \
+    env CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+}
+
+bwrap_pid_ns_usable() {
+  command -v bwrap >/dev/null 2>&1 || return 1
+  bwrap --unshare-pid --ro-bind / / --proc /proc --dev /dev -- true 2>/dev/null
 }
 
 test_hook_silent_when_no_work_in_flight() {
@@ -239,6 +259,111 @@ test_hook_blocks_with_live_lock_and_stale_beacon() {
   expect_code 2 "$status" "hook must block when a live watcher lock has an ancient beacon"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: blocks on a live watcher lock with an ancient beacon"
+}
+
+test_hook_blocks_dead_lock_with_matching_namespace() {
+  local dir dead own_ns out status
+  own_ns=$(own_pid_namespace) || own_ns=
+  if [ -z "$own_ns" ]; then
+    pass "fm-turnend-guard: same-namespace dead-lock case skipped (/proc/self/ns/pid unreadable on this host)"
+    return
+  fi
+  dir=$(make_primary_dir "$TMP_ROOT/hook-dead-lock-same-ns")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  record_watcher_lock "$dir" "$dead" "dead watcher identity" "$own_ns"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must still block on a dead watcher lock when the caller shares the recorded PID namespace"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: matching recorded PID namespace keeps the full dead-lock block"
+}
+
+test_hook_silent_cross_namespace_lock_with_fresh_beacon() {
+  # From a different PID namespace the watcher pid is invisible, so a pid that
+  # does not resolve here must not fail health when home/path match and the
+  # beacon is fresh. A never-matching recorded namespace simulates the sandbox.
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cross-ns-fresh")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  record_watcher_lock "$dir" "$dead" "invisible watcher identity" 'pid:[fm-test-other-namespace]'
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "hook must accept a cross-namespace lock on home/path match plus a fresh beacon"
+  [ -z "$out" ] || fail "hook produced output for a healthy cross-namespace lock: $out"
+  pass "fm-turnend-guard: cross-namespace lock passes on home/path match and a fresh beacon"
+}
+
+test_hook_blocks_cross_namespace_lock_with_stale_beacon() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cross-ns-stale")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  record_watcher_lock "$dir" "$dead" "invisible watcher identity" 'pid:[fm-test-other-namespace]'
+  touch -t 202001010000 "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block a cross-namespace lock when the beacon is stale"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: cross-namespace lock still blocks on a stale beacon"
+}
+
+test_hook_blocks_cross_namespace_lock_with_wrong_home() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cross-ns-wrong-home")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  record_watcher_lock "$dir" "$dead" "invisible watcher identity" 'pid:[fm-test-other-namespace]'
+  printf '%s\n' "$TMP_ROOT/some-other-home" > "$dir/state/.watch.lock/fm-home"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block a cross-namespace lock that names another home"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: cross-namespace lock still blocks when fm-home does not match"
+}
+
+test_hook_bwrap_unshared_pid_namespace_e2e() {
+  # The 2026-07-09 false-alarm repro (docs/turnend-guard.md): a live watcher,
+  # identity-matched lock, fresh beacon, and the hook running in an unshared PID
+  # namespace where that pid is invisible.
+  local dir pid identity own_ns out status control_status
+  if ! bwrap_pid_ns_usable; then
+    pass "fm-turnend-guard: bwrap PID-namespace e2e skipped (bwrap unavailable or cannot unshare pid here)"
+    return
+  fi
+  own_ns=$(own_pid_namespace) || own_ns=
+  if [ -z "$own_ns" ]; then
+    pass "fm-turnend-guard: bwrap PID-namespace e2e skipped (/proc/self/ns/pid unreadable on this host)"
+    return
+  fi
+  dir=$(make_primary_dir "$TMP_ROOT/hook-bwrap-ns")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  # Control without the recorded namespace: the sandbox cannot see the live
+  # watcher pid, so the pre-fix false alarm must reproduce. If it does not,
+  # this sandbox does not hide external pids and proves nothing - skip.
+  run_hook_in_pid_ns_sandbox "$dir" >/dev/null 2>&1; control_status=$?
+  if [ "$control_status" -ne 2 ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pass "fm-turnend-guard: bwrap PID-namespace e2e skipped (sandbox did not hide external pids; control exit $control_status)"
+    return
+  fi
+  printf '%s\n' "$own_ns" > "$dir/state/.watch.lock/pid-namespace"
+  out=$(run_hook_in_pid_ns_sandbox "$dir"); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must exit 0 from an unshared PID namespace against a live watcher"
+  [ -z "$out" ] || fail "hook printed a banner from the PID-namespace sandbox: $out"
+  pass "fm-turnend-guard: no false alarm from an unshared-PID-namespace sandbox (bwrap e2e)"
 }
 
 test_hook_blocks_when_unhealthy_in_primary() {
@@ -722,6 +847,11 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
+test_hook_blocks_dead_lock_with_matching_namespace
+test_hook_silent_cross_namespace_lock_with_fresh_beacon
+test_hook_blocks_cross_namespace_lock_with_stale_beacon
+test_hook_blocks_cross_namespace_lock_with_wrong_home
+test_hook_bwrap_unshared_pid_namespace_e2e
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence

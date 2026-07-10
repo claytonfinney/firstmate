@@ -449,6 +449,35 @@ test_watch_restart_reports_healthy_peer_without_attaching() {
   pass "watch restart reports a healthy peer without attaching to it"
 }
 
+test_watch_lock_records_pid_namespace() {
+  # fm_watcher_healthy's cross-namespace acceptance (docs/turnend-guard.md)
+  # depends on the watcher recording its PID namespace at lock acquisition.
+  local dir state fakebin out pid i own_ns lock_ns
+  own_ns=$(readlink /proc/self/ns/pid 2>/dev/null || true)
+  if [ -z "$own_ns" ]; then
+    pass "watcher pid-namespace recording skipped (/proc/self/ns/pid unreadable on this host)"
+    return
+  fi
+  dir=$(make_case ns-record)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  lock_ns=
+  while [ "$i" -lt 60 ]; do
+    lock_ns=$(cat "$state/.watch.lock/pid-namespace" 2>/dev/null || true)
+    [ -n "$lock_ns" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$lock_ns" = "$own_ns" ] || fail "watcher recorded pid-namespace '$lock_ns', expected '$own_ns'"
+  pass "watcher records its PID namespace in the lock owner dir"
+}
+
 test_watcher_self_evicts_on_lock_takeover() {
   local dir state fakebin out pid i lock_pid
   dir=$(make_case self-evict)
@@ -718,6 +747,7 @@ test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
 test_watch_restart_reports_healthy_peer_without_attaching
+test_watch_lock_records_pid_namespace
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_starts_and_self_heals

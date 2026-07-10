@@ -36,6 +36,10 @@ fm_pid_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
+fm_pid_namespace() {
+  readlink /proc/self/ns/pid 2>/dev/null
+}
+
 fm_path_mtime() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -50,17 +54,38 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
-fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+fm_watcher_lock_matches_home_path() {
+  local state=$1 watch_path=$2 home=${3:-$FM_HOME} lockdir lock_home lock_path
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
-  lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
   [ "$lock_home" = "$home" ] || return 1
-  [ "$lock_path" = "$watch_path" ] || return 1
+  [ "$lock_path" = "$watch_path" ]
+}
+
+fm_watcher_lock_matches_pid() {
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_identity current_identity
+  lockdir="$state/.watch.lock"
+  fm_watcher_lock_matches_home_path "$state" "$watch_path" "$home" || return 1
+  lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
   [ -n "$lock_identity" ] || return 1
   current_identity=$(fm_pid_identity "$pid") || return 1
   [ "$current_identity" = "$lock_identity" ]
+}
+
+# Whether the caller shares the recorded watcher PID namespace, so pid liveness
+# and identity reads against the lock's pid are meaningful from here. An absent
+# or empty recorded namespace (an older watcher's lock, or a host without
+# /proc) keeps the pid-check behavior. A recorded namespace the caller does not
+# share - or cannot read its own to compare, as in a sandboxed hook running in
+# an unshared PID namespace - does not: external pids are invisible there.
+fm_watcher_lock_ns_matches() {
+  local lockdir=$1 lock_ns own_ns
+  lock_ns=$(cat "$lockdir/pid-namespace" 2>/dev/null || true)
+  [ -n "$lock_ns" ] || return 0
+  own_ns=$(fm_pid_namespace || true)
+  [ -n "$own_ns" ] || return 1
+  [ "$own_ns" = "$lock_ns" ]
 }
 
 FM_WATCHER_HEALTHY_PID=
@@ -70,8 +95,17 @@ fm_watcher_healthy() {
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  fm_pid_alive "$pid" || return 1
-  fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
+  if fm_watcher_lock_ns_matches "$lockdir"; then
+    fm_pid_alive "$pid" || return 1
+    fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
+  else
+    # Cross-namespace caller: pid liveness/identity would reject a live watcher
+    # whose pid this namespace cannot see, so accept on home/path match plus the
+    # fresh-beacon check below. A dead watcher's beacon goes stale after at most
+    # FM_GUARD_GRACE seconds, at which point fm-guard.sh's banner and turn-end
+    # blocking resume as the dead-watcher backstop.
+    fm_watcher_lock_matches_home_path "$state" "$watch_path" "$home" || return 1
+  fi
   age=$(fm_path_age "$beat")
   [ "$age" -lt "$grace" ] || return 1
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.
@@ -85,6 +119,7 @@ fm_lock_clean_known_files() {
     "$lockdir/pid" \
     "$lockdir/fm-home" \
     "$lockdir/pid-identity" \
+    "$lockdir/pid-namespace" \
     "$lockdir/watcher-path" \
     2>/dev/null || true
 }

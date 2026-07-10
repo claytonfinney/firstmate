@@ -28,6 +28,12 @@ That is the same identity-matched live lock and fresh beacon check used by `bin/
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
 
+The health check is PID-namespace-aware.
+At lock acquisition, `bin/fm-watch.sh` records `readlink /proc/self/ns/pid` as `pid-namespace` in the lock owner dir, alongside `pid`, `pid-identity`, `fm-home`, and `watcher-path`.
+A caller in the same namespace, or reading a lock with no recorded namespace (an older watcher's lock, or a host without `/proc`), keeps the full pid liveness and identity checks.
+A caller in a different namespace, or one that cannot read its own `/proc/self/ns/pid`, cannot see the watcher pid at all, so `fm_watcher_healthy` instead accepts the watcher when the lock's `fm-home` and `watcher-path` match and the beacon is fresh, skipping `fm_pid_alive` and `fm_pid_identity`.
+For a namespaced caller, a genuinely dead watcher whose lock recorded a namespace is accepted only until its beacon goes stale after at most `FM_GUARD_GRACE` seconds, at which point both `bin/fm-guard.sh`'s pull-based banner and turn-end blocking resume as the dead-watcher backstop; same-namespace behavior is unchanged.
+
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
 If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 because it cannot safely read loop-guard fields.
@@ -112,8 +118,18 @@ If Grok declines to load project hooks, this primary guard fails open and `fm-gu
 The hook command was fixed to reference `${GROK_WORKSPACE_ROOT:-}` directly everywhere instead of assigning it to `$root` first, and re-validated against grok 0.2.93 to fire and complete cleanly.
 See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok expansion requirement; that document's Grok hook shares the same fix.
 
+**2026-07-09 update:** on a Linux 6.12.75+rpt-rpi-v8 host, Claude Code executed Stop hooks in a sandbox with an unshared PID namespace, so the guard blocked every genuine turn end with `TURN WOULD END BLIND - SUPERVISION IS OFF` while the watcher was alive with an identity-matched lock and a fresh beacon.
+Inside that namespace, external processes are invisible: `kill -0 <watcher-pid>` failed with `No such process` and `ps -p <watcher-pid>` returned nothing, so `fm_pid_alive` and `fm_pid_identity` rejected the live watcher while the banner's beacon read still showed `last beat: Ns ago` fresh.
+Manual runs of the guard from a normal shell exited 0 against the same lock state.
+Command run to reproduce against a live watcher: `bwrap --unshare-pid --ro-bind / / --proc /proc --dev /dev -- bash -c 'echo "{\"stop_hook_active\":false}" | bin/fm-turnend-guard.sh; echo rc=$?'`.
+Observed output before the fix: the bordered banner plus `rc=2` inside bwrap, while the same command outside bwrap printed nothing and exited 0.
+The fix is the namespace-aware health check described in Shared Predicate: `bin/fm-watch.sh` records `pid-namespace` at lock acquisition, and `bin/fm-wake-lib.sh` skips the meaningless pid checks only for cross-namespace callers.
+Observed output after the fix on the same host: the bwrap repro printed nothing and exited `rc=0`; a bwrap control with the lock's `pid-namespace` file removed still printed the banner and exited `rc=2` (the backward-compat pid-check path); a dead watcher pid with a matching recorded namespace still blocked with `rc=2` outside the sandbox; and a cross-namespace lock with a stale beacon still blocked with `rc=2`.
+The remaining fail-open tradeoff is deliberate and bounded: a watcher that dies leaves its beacon fresh for up to `FM_GUARD_GRACE` seconds, during which a namespaced caller accepts the lock on `fm-home`/`watcher-path` match alone; once the beacon goes stale after at most `FM_GUARD_GRACE` seconds, both `bin/fm-guard.sh`'s pull-based banner and turn-end blocking resume as the dead-watcher backstop.
+
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
-The default behavior suite does not invoke live language-model harnesses.
-`FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, loop-safety, fail-open behavior without `jq`, tracked hook registration for all five harnesses, the Grok adapter's forced-resume loop guard and permission-mode regression, and the PID-namespace cases (same-namespace dead lock still blocks, cross-namespace lock passes on home/path match plus fresh beacon and blocks on a stale beacon or wrong home, plus a `bwrap --unshare-pid` end-to-end repro that skips when `bwrap` is unavailable).
+`tests/fm-watcher-lock.test.sh` covers that a real watcher records `pid-namespace` in its lock owner dir.
+These tests do not invoke live harnesses.
+Live harness validation is the empirical evidence recorded above.
