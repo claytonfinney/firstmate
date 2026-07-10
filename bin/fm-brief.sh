@@ -49,7 +49,7 @@ case "${1:-}" in
   -h|--help) usage; exit 0 ;;
 esac
 
-# shellcheck source=bin/fm-marker-lib.sh
+# shellcheck source=bin/fm-marker-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -277,7 +277,9 @@ Two firstmate-specific rules layer on top of that guidance:
 If the no-mistakes PUSH step fails to authenticate to GitHub (\`could not read Username\` / \`terminal prompts disabled\`), do not stop - this is the pipeline's scrubbed-env dropping \`GH_TOKEN\`.
 Fall back: push your \`fm/$ID\` branch directly from your own shell (which has \`GH_TOKEN\`), then open or refresh the PR with \`gh-axi\`.
 Never persist the token to \`~/.git-credentials\`.
-Then continue as normal.
+This manual push + PR is the terminal step for the task - do NOT start a new no-mistakes run afterward.
+A push-only failure means every earlier gate (review, test, document, lint) already passed, so re-validating just repeats the slow work for nothing.
+Append \`done: PR {url}\` and stop.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
