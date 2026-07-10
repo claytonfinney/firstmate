@@ -206,17 +206,17 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
   pass "fm-turnend-guard: blocks when a fresh beacon has no live watcher lock"
 }
 
-test_hook_blocks_when_dead_lock_has_fresh_beacon() {
+test_hook_silent_when_unknown_namespace_lock_has_fresh_beacon() {
   local dir dead out status
-  dir=$(make_primary_dir "$TMP_ROOT/hook-dead-lock-fresh")
+  dir=$(make_primary_dir "$TMP_ROOT/hook-unknown-ns-lock-fresh")
   dead=$(nonexistent_pid)
   : > "$dir/state/task1.meta"
   record_watcher_lock "$dir" "$dead" "dead watcher identity"
   touch "$dir/state/.last-watcher-beat"
   out=$(run_hook "$dir" false); status=$?
-  expect_code 2 "$status" "hook must block when the watcher lock pid is dead despite a fresh beacon"
-  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
-  pass "fm-turnend-guard: blocks on a dead watcher lock even when the beacon is fresh"
+  expect_code 0 "$status" "hook must accept an unknown-namespace lock on home/path match plus a fresh beacon"
+  [ -z "$out" ] || fail "hook produced output for an unknown-namespace fresh beacon: $out"
+  pass "fm-turnend-guard: unknown-namespace lock passes on home/path match and a fresh beacon"
 }
 
 test_hook_silent_with_live_lock_and_fresh_beacon() {
@@ -238,6 +238,32 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
   [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+}
+
+test_hook_silent_with_same_namespace_live_lock_and_fresh_beacon() {
+  local dir pid identity own_ns out status
+  own_ns=$(own_pid_namespace) || own_ns=
+  if [ -z "$own_ns" ]; then
+    pass "fm-turnend-guard: same-namespace live-lock case skipped (/proc/self/ns/pid unreadable on this host)"
+    return
+  fi
+  dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-same-ns")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity" "$own_ns"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must exit 0 with a same-namespace live watcher lock and fresh beacon"
+  [ -z "$out" ] || fail "hook produced output despite a same-namespace live watcher lock: $out"
+  pass "fm-turnend-guard: matching recorded PID namespace keeps the live-lock pass"
 }
 
 test_hook_blocks_with_live_lock_and_stale_beacon() {
@@ -293,6 +319,36 @@ test_hook_silent_cross_namespace_lock_with_fresh_beacon() {
   expect_code 0 "$status" "hook must accept a cross-namespace lock on home/path match plus a fresh beacon"
   [ -z "$out" ] || fail "hook produced output for a healthy cross-namespace lock: $out"
   pass "fm-turnend-guard: cross-namespace lock passes on home/path match and a fresh beacon"
+}
+
+test_hook_silent_unknown_namespace_unreadable_lock_with_fresh_beacon() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-unknown-ns-unreadable-fresh")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  mkdir -p "$dir/state/.watch.lock"
+  printf '%s\n' "$dead" > "$dir/state/.watch.lock/pid"
+  : > "$dir/state/.watch.lock/pid-namespace"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "hook must accept an unknown-namespace lock on a fresh home-scoped beacon when lock metadata is unreadable"
+  [ -z "$out" ] || fail "hook produced output for an unknown-namespace fresh beacon: $out"
+  pass "fm-turnend-guard: unknown namespace with unreadable lock metadata passes on a fresh beacon"
+}
+
+test_hook_blocks_unknown_namespace_unreadable_lock_with_stale_beacon() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-unknown-ns-unreadable-stale")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  mkdir -p "$dir/state/.watch.lock"
+  printf '%s\n' "$dead" > "$dir/state/.watch.lock/pid"
+  : > "$dir/state/.watch.lock/pid-namespace"
+  touch -t 202001010000 "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block an unknown-namespace lock when the home-scoped beacon is stale"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: unknown namespace with unreadable lock metadata still blocks on a stale beacon"
 }
 
 test_hook_blocks_cross_namespace_lock_with_stale_beacon() {
@@ -844,11 +900,14 @@ test_predicate_healthy_fresh_beacon
 test_predicate_queue_pending_flag
 test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
-test_hook_blocks_when_dead_lock_has_fresh_beacon
+test_hook_silent_when_unknown_namespace_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_silent_with_same_namespace_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_dead_lock_with_matching_namespace
 test_hook_silent_cross_namespace_lock_with_fresh_beacon
+test_hook_silent_unknown_namespace_unreadable_lock_with_fresh_beacon
+test_hook_blocks_unknown_namespace_unreadable_lock_with_stale_beacon
 test_hook_blocks_cross_namespace_lock_with_stale_beacon
 test_hook_blocks_cross_namespace_lock_with_wrong_home
 test_hook_bwrap_unshared_pid_namespace_e2e
