@@ -274,6 +274,11 @@ Two firstmate-specific rules layer on top of that guidance:
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
 
+If the no-mistakes PUSH step fails to authenticate to GitHub (\`could not read Username\` / \`terminal prompts disabled\`), do not stop - this is the pipeline's scrubbed-env dropping \`GH_TOKEN\`.
+Fall back: push your \`fm/$ID\` branch directly from your own shell (which has \`GH_TOKEN\`), then open or refresh the PR with \`gh-axi\`.
+Never persist the token to \`~/.git-credentials\`.
+Then continue as normal.
+
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
 )
