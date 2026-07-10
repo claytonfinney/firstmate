@@ -75,14 +75,15 @@ fm_watcher_lock_matches_pid() {
 
 # Whether the caller shares the recorded watcher PID namespace, so pid liveness
 # and identity reads against the lock's pid are meaningful from here. An absent
-# or empty recorded namespace (an older watcher's lock, or a host without
-# /proc) keeps the pid-check behavior. A recorded namespace the caller does not
-# share - or cannot read its own to compare, as in a sandboxed hook running in
-# an unshared PID namespace - does not: external pids are invisible there.
+# or empty recorded namespace cannot confirm sameness, so treat it like a
+# cross-namespace/unknown caller. External pids are invisible from a sandboxed
+# hook running in an unshared PID namespace, and that same sandbox may be unable
+# to read the symlinked lock owner dir even while it can read the home-scoped
+# watcher beacon.
 fm_watcher_lock_ns_matches() {
   local lockdir=$1 lock_ns own_ns
   lock_ns=$(cat "$lockdir/pid-namespace" 2>/dev/null || true)
-  [ -n "$lock_ns" ] || return 0
+  [ -n "$lock_ns" ] || return 1
   own_ns=$(fm_pid_namespace || true)
   [ -n "$own_ns" ] || return 1
   [ "$own_ns" = "$lock_ns" ]
@@ -90,10 +91,11 @@ fm_watcher_lock_ns_matches() {
 
 FM_WATCHER_HEALTHY_PID=
 fm_watcher_healthy() {
-  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age lock_home
   FM_WATCHER_HEALTHY_PID=
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"
+  [ -e "$lockdir" ] || [ -L "$lockdir" ] || return 1
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   if fm_watcher_lock_ns_matches "$lockdir"; then
     fm_pid_alive "$pid" || return 1
@@ -104,7 +106,10 @@ fm_watcher_healthy() {
     # fresh-beacon check below. A dead watcher's beacon goes stale after at most
     # FM_GUARD_GRACE seconds, at which point fm-guard.sh's banner and turn-end
     # blocking resume as the dead-watcher backstop.
-    fm_watcher_lock_matches_home_path "$state" "$watch_path" "$home" || return 1
+    lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
+    if [ -n "$lock_home" ]; then
+      fm_watcher_lock_matches_home_path "$state" "$watch_path" "$home" || return 1
+    fi
   fi
   age=$(fm_path_age "$beat")
   [ "$age" -lt "$grace" ] || return 1
